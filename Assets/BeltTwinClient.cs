@@ -33,6 +33,7 @@ public class BeltTwinClient : MonoBehaviour
     public string host = "localhost";
     public int port = 1883;
     public string topic = "conveyor2/telemetry";
+    public string cmdTopic = "conveyor2/cmd";
 
     [Header("Link")]
     public float staleAfterSeconds = 1.0f;
@@ -42,6 +43,7 @@ public class BeltTwinClient : MonoBehaviour
     public float msgRate;
     public bool linkOk;
     public Telemetry latest;
+    public string lastCommand = "";
 
     IMqttClient client;
     readonly object lk = new object();
@@ -91,6 +93,29 @@ public class BeltTwinClient : MonoBehaviour
         catch (Exception ex)
         {
             Debug.LogError("MQTT connect failed: " + ex.Message);
+        }
+    }
+
+    public async void SendCommand(string cmd)
+    {
+        if (client == null || !client.IsConnected)
+        {
+            Debug.LogWarning("Not connected, command dropped: " + cmd);
+            return;
+        }
+        try
+        {
+            var msg = new MqttApplicationMessageBuilder()
+                .WithTopic(cmdTopic)
+                .WithPayload("{\"cmd\":\"" + cmd + "\"}")
+                .Build();
+            await client.PublishAsync(msg, CancellationToken.None);
+            lastCommand = cmd + "  @ " + DateTime.Now.ToString("HH:mm:ss");
+            Debug.Log("Sent command: " + cmd);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("Command publish failed: " + ex.Message);
         }
     }
 
@@ -173,6 +198,29 @@ public class BeltTwinClient : MonoBehaviour
             GUI.Box(r, "NO DATA — CHECK PIPELINE", linkStyle);
         else if (latest != null && latest.eState == 3)
             GUI.Box(r, "FAULT: " + FaultName(latest.eFaultCode), faultStyle);
+
+        // Control panel, bottom of screen
+        float py = Screen.height - 110;
+        GUI.Box(new Rect(5, py, 620, 105), "");
+        GUI.Label(new Rect(12, py + 4, 600, 20),
+            "Control" + (lastCommand != "" ? "   last: " + lastCommand : ""), textStyle);
+
+        bool canSend = client != null && client.IsConnected;
+        GUI.enabled = canSend;
+
+        float bw = 95, bh = 30, x = 12, y1 = py + 28, y2 = py + 66;
+        if (GUI.Button(new Rect(x, y1, bw, bh), "START")) SendCommand("start");
+        if (GUI.Button(new Rect(x + (bw + 5), y1, bw, bh), "STOP")) SendCommand("stop");
+        if (GUI.Button(new Rect(x + (bw + 5) * 2, y1, bw, bh), "RESET")) SendCommand("reset");
+
+        GUI.Label(new Rect(x, y2 - 18, 300, 18), "Inject fault:", textStyle);
+        if (GUI.Button(new Rect(x, y2, bw, bh), "JAM")) SendCommand("jam");
+        if (GUI.Button(new Rect(x + (bw + 5), y2, bw, bh), "SLIP")) SendCommand("slip");
+        if (GUI.Button(new Rect(x + (bw + 5) * 2, y2, bw, bh), "OVERLOAD")) SendCommand("overload");
+        if (GUI.Button(new Rect(x + (bw + 5) * 3, y2, bw, bh), "WEAR")) SendCommand("wear");
+        if (GUI.Button(new Rect(x + (bw + 5) * 4, y2, bw, bh), "MANUAL")) SendCommand("fault");
+
+        GUI.enabled = true;
     }
 
     async void OnDestroy()
