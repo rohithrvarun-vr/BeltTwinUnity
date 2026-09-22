@@ -51,8 +51,11 @@ public class BeltVisual : MonoBehaviour
             carriers[i].localPosition = new Vector3(x, 0.9f, 0f);
         }
 
-        if (t != null && beltRenderer != null)
-            beltRenderer.material.color = StateColour(t.eState);
+        if (beltRenderer != null)
+        {
+            bool live = client != null && client.linkOk && t != null;
+            beltRenderer.material.color = live ? StateColour(t.eState) : new Color(0.3f, 0.3f, 0.3f);
+        }
     }
 
     Color StateColour(int s)

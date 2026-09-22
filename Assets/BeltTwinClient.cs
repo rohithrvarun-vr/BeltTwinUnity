@@ -51,7 +51,7 @@ public class BeltTwinClient : MonoBehaviour
     int rateStart;
     float lastMsgTime = -999f;
 
-    GUIStyle bannerStyle, textStyle;
+    GUIStyle faultStyle, linkStyle, textStyle;
 
     static readonly string[] StateNames = { "STOPPED", "STARTING", "RUNNING", "FAULTED" };
     static readonly string[] FaultNames = { "NONE", "JAM", "BELT SLIP", "BEARING WEAR", "MOTOR OVERLOAD", "MANUAL FAULT" };
@@ -120,17 +120,33 @@ public class BeltTwinClient : MonoBehaviour
         }
     }
 
+    static Texture2D MakeTex(Color c)
+    {
+        var t = new Texture2D(1, 1);
+        t.SetPixel(0, 0, c);
+        t.Apply();
+        return t;
+    }
+
+    static GUIStyle MakeBanner(Color bg)
+    {
+        var s = new GUIStyle(GUI.skin.box)
+        {
+            fontSize = 28,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.MiddleCenter
+        };
+        s.normal.background = MakeTex(bg);
+        s.normal.textColor = Color.white;
+        return s;
+    }
+
     void OnGUI()
     {
-        if (bannerStyle == null)
+        if (faultStyle == null)
         {
-            bannerStyle = new GUIStyle(GUI.skin.box)
-            {
-                fontSize = 28,
-                fontStyle = FontStyle.Bold,
-                alignment = TextAnchor.MiddleCenter
-            };
-            bannerStyle.normal.textColor = Color.white;
+            faultStyle = MakeBanner(new Color(0.80f, 0.10f, 0.10f, 0.92f));
+            linkStyle = MakeBanner(new Color(0.95f, 0.55f, 0.00f, 0.92f));
             textStyle = new GUIStyle(GUI.skin.label) { fontSize = 14 };
             textStyle.normal.textColor = Color.white;
         }
@@ -150,23 +166,13 @@ public class BeltTwinClient : MonoBehaviour
                 textStyle);
         }
 
-        // Banners, centred at the top
+        // Banners: link loss takes priority over faults
         float w = 460f, h = 56f;
-        var bannerRect = new Rect((Screen.width - w) / 2f, 110, w, h);
-        var old = GUI.backgroundColor;
-
+        var r = new Rect((Screen.width - w) / 2f, 110, w, h);
         if (!linkOk)
-        {
-            GUI.backgroundColor = new Color(1f, 0.6f, 0f);
-            GUI.Box(bannerRect, "NO DATA — CHECK PIPELINE", bannerStyle);
-        }
+            GUI.Box(r, "NO DATA — CHECK PIPELINE", linkStyle);
         else if (latest != null && latest.eState == 3)
-        {
-            GUI.backgroundColor = Color.red;
-            GUI.Box(bannerRect, "FAULT: " + FaultName(latest.eFaultCode), bannerStyle);
-        }
-
-        GUI.backgroundColor = old;
+            GUI.Box(r, "FAULT: " + FaultName(latest.eFaultCode), faultStyle);
     }
 
     async void OnDestroy()
