@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,6 +27,18 @@ public class Telemetry
     public float rBearingTemp;
     public float rVibration;
     public float rAmbientTemp;
+    public long nMaintenanceCount;
+}
+
+[Serializable]
+public class Detection
+{
+    public string @event;      // "prediction", "not_running", "detector_online", "detector_offline"
+    public string pred;        // healthy / jam / slip / overload / wear
+    public float confidence;
+    public float speed;
+    public long plc_ts;        // Node-RED ts of the sample that triggered the event
+    public long ts;
 }
 
 public class BeltTwinClient : MonoBehaviour
@@ -35,6 +48,7 @@ public class BeltTwinClient : MonoBehaviour
     public int port = 1883;
     public string topic = "conveyor2/telemetry";
     public string cmdTopic = "conveyor2/cmd";
+    public string detTopic = "conveyor2/detection";
 
     [Header("Link")]
     public float staleAfterSeconds = 1.0f;
@@ -47,6 +61,15 @@ public class BeltTwinClient : MonoBehaviour
     public int reconnects;
     public Telemetry latest;
     public string lastCommand = "";
+
+    [Header("RF detector (read-only)")]
+    public Detection det;
+    public string rfPredFault = "";   // fault the RF is currently calling while Running
+    public string rfVerdict = "";     // set when the PLC trips
+    long rfPredTs;
+    bool rfVerdictGood;
+    int prevState = -1;
+    readonly ConcurrentQueue<string> detQ = new ConcurrentQueue<string>();
 
     [Header("Latency (read-only, ms)")]
     public float mqttMedian;
@@ -72,7 +95,7 @@ public class BeltTwinClient : MonoBehaviour
     readonly float[] latAge = new float[240];
     int latIdx, latN;
 
-    GUIStyle faultStyle, linkStyle, textStyle;
+    GUIStyle faultStyle, linkStyle, textStyle, rfWarn, rfOk, rfIdle, rfGood, rfBad;
 
     static readonly string[] StateNames = { "STOPPED", "STARTING", "RUNNING", "FAULTED" };
     static readonly string[] FaultNames = { "NONE", "JAM", "BELT SLIP", "BEARING WEAR", "MOTOR OVERLOAD", "MANUAL FAULT" };
@@ -89,9 +112,17 @@ public class BeltTwinClient : MonoBehaviour
         client.ApplicationMessageReceivedAsync += e =>
         {
             var seg = e.ApplicationMessage.PayloadSegment;
+            if (seg.Array == null || seg.Count == 0) return Task.CompletedTask;
             string s = Encoding.UTF8.GetString(seg.Array, seg.Offset, seg.Count);
-            lock (lk) { pending = s; }
-            Interlocked.Increment(ref received);
+            if (e.ApplicationMessage.Topic == detTopic)
+            {
+                detQ.Enqueue(s);                       // detection events: keep every one, in order
+            }
+            else
+            {
+                lock (lk) { pending = s; }             // telemetry: only the newest matters
+                Interlocked.Increment(ref received);
+            }
             return Task.CompletedTask;
         };
 
@@ -110,13 +141,14 @@ public class BeltTwinClient : MonoBehaviour
 
         subOpts = factory.CreateSubscribeOptionsBuilder()
             .WithTopicFilter(f => f.WithTopic(topic))
+            .WithTopicFilter(f => f.WithTopic(detTopic))
             .Build();
 
         try
         {
             await client.ConnectAsync(opts, CancellationToken.None);
             await client.SubscribeAsync(subOpts, CancellationToken.None);
-            Debug.Log("MQTT connected, subscribed to " + topic);
+            Debug.Log("MQTT connected, subscribed to " + topic + " and " + detTopic);
         }
         catch (Exception ex)
         {
@@ -184,6 +216,7 @@ public class BeltTwinClient : MonoBehaviour
             {
                 latest = JsonUtility.FromJson<Telemetry>(s);
                 lastMsgTime = Time.time;
+                TrackTrip(latest);
 
                 // Latency: same machine, same clock, so subtraction is valid
                 long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -199,6 +232,12 @@ public class BeltTwinClient : MonoBehaviour
             catch (Exception ex) { Debug.LogWarning("Parse failed: " + ex.Message); }
         }
 
+        while (detQ.TryDequeue(out var ds))
+        {
+            try { det = JsonUtility.FromJson<Detection>(ds); OnDetection(det); }
+            catch (Exception ex) { Debug.LogWarning("Detection parse failed: " + ex.Message); }
+        }
+
         linkOk = (Time.time - lastMsgTime) < staleAfterSeconds;
 
         msgCount = received;
@@ -209,6 +248,56 @@ public class BeltTwinClient : MonoBehaviour
             rateStart = msgCount;
             rateTimer = 0f;
         }
+    }
+
+    static int FaultCodeOf(string pred)
+    {
+        switch (pred)
+        {
+            case "jam": return 1;
+            case "slip": return 2;
+            case "wear": return 3;
+            case "overload": return 4;
+            default: return 0;
+        }
+    }
+
+    void OnDetection(Detection d)
+    {
+        // Only predictions made while Running count; "not_running" also arrives right
+        // after a trip, so it must NOT clear the pre-trip prediction.
+        if (d.@event != "prediction") return;
+        if (latest != null && latest.eState != 2) return;
+        if (d.pred == "healthy") { rfPredFault = ""; return; }
+        if (d.pred != rfPredFault) { rfPredFault = d.pred; rfPredTs = d.plc_ts; }
+    }
+
+    void TrackTrip(Telemetry t)
+    {
+        if (t.eState == 1 && prevState != 1) { rfPredFault = ""; rfVerdict = ""; }   // new run
+        if (t.eState == 3 && prevState == 2)
+        {
+            if (t.eFaultCode == 5)
+            {
+                rfVerdict = "Manual fault: no sensor signature, RF not expected to see it";
+                rfVerdictGood = true;
+            }
+            else if (rfPredFault != "")
+            {
+                // both timestamps are Node-RED ts, so the difference is consistent
+                float lead = (t.ts - rfPredTs) / 1000f;
+                rfVerdictGood = FaultCodeOf(rfPredFault) == t.eFaultCode;
+                rfVerdict = rfVerdictGood
+                    ? $"RF called {rfPredFault.ToUpper()} {lead:F1} s before the PLC tripped"
+                    : $"RF said {rfPredFault.ToUpper()}, PLC tripped on {FaultName(t.eFaultCode)}";
+            }
+            else
+            {
+                rfVerdict = "RF did not detect this fault before the PLC tripped";
+                rfVerdictGood = false;
+            }
+        }
+        prevState = t.eState;
     }
 
     void ComputeLatency()
@@ -229,11 +318,11 @@ public class BeltTwinClient : MonoBehaviour
         return t;
     }
 
-    static GUIStyle MakeBanner(Color bg)
+    static GUIStyle MakeBanner(Color bg, int size = 28)
     {
         var s = new GUIStyle(GUI.skin.box)
         {
-            fontSize = 28,
+            fontSize = size,
             fontStyle = FontStyle.Bold,
             alignment = TextAnchor.MiddleCenter
         };
@@ -250,6 +339,11 @@ public class BeltTwinClient : MonoBehaviour
             linkStyle = MakeBanner(new Color(0.95f, 0.55f, 0.00f, 0.92f));
             textStyle = new GUIStyle(GUI.skin.label) { fontSize = 14 };
             textStyle.normal.textColor = Color.white;
+            rfWarn = MakeBanner(new Color(0.45f, 0.20f, 0.75f, 0.92f), 20);   // purple: RF calls a fault
+            rfOk   = MakeBanner(new Color(0.10f, 0.10f, 0.10f, 0.60f), 16);
+            rfIdle = MakeBanner(new Color(0.30f, 0.30f, 0.30f, 0.60f), 16);
+            rfGood = MakeBanner(new Color(0.10f, 0.55f, 0.20f, 0.92f), 20);
+            rfBad  = MakeBanner(new Color(0.50f, 0.10f, 0.10f, 0.92f), 20);
         }
 
         bool connected = client != null && client.IsConnected;
@@ -266,7 +360,7 @@ public class BeltTwinClient : MonoBehaviour
                 $"{StateName(latest.eState)}   fault: {FaultName(latest.eFaultCode)}   speed {latest.rSpeed:F1}   pos {latest.rPosition:F1}",
                 textStyle);
             GUI.Label(new Rect(12, 54, 660, 20),
-                $"Current {latest.rMotorCurrent:F2} A   Motor {latest.rMotorTemp:F1} °C   Bearing {latest.rBearingTemp:F1} °C   Vib {latest.rVibration:F2}",
+                $"Current {latest.rMotorCurrent:F2} A   Motor {latest.rMotorTemp:F1} Â°C   Bearing {latest.rBearingTemp:F1} Â°C   Vib {latest.rVibration:F2}",
                 textStyle);
             GUI.Label(new Rect(12, 76, 660, 20),
                 latN > 0
@@ -279,9 +373,29 @@ public class BeltTwinClient : MonoBehaviour
         float w = 460f, h = 56f;
         var r = new Rect((Screen.width - w) / 2f, 130, w, h);
         if (!linkOk)
-            GUI.Box(r, "NO DATA — CHECK PIPELINE", linkStyle);
+            GUI.Box(r, "NO DATA - CHECK PIPELINE", linkStyle);
         else if (latest != null && latest.eState == 3)
             GUI.Box(r, "FAULT: " + FaultName(latest.eFaultCode), faultStyle);
+
+        // RF detector banner, under the PLC banner
+        float rw = 640f, rh = 40f;
+        var rr = new Rect((Screen.width - rw) / 2f, 192, rw, rh);
+        string rfText; GUIStyle rfSt;
+        int st = latest != null ? latest.eState : -1;
+        if (!linkOk)                                  { rfText = "RF: no telemetry"; rfSt = rfIdle; }
+        else if (det == null)                         { rfText = "RF: waiting for detector"; rfSt = rfIdle; }
+        else if (det.@event == "detector_offline")    { rfText = "RF: detector offline"; rfSt = rfIdle; }
+        else if ((st == 3 || st == 0) && rfVerdict != "") { rfText = rfVerdict; rfSt = rfVerdictGood ? rfGood : rfBad; }
+        else if (st == 2 && rfPredFault != "")
+        {
+            float since = (latest.ts - rfPredTs) / 1000f;
+            rfText = $"RF: {rfPredFault.ToUpper()} predicted ({det.confidence:F2}), PLC not tripped yet, {since:F0} s";
+            rfSt = rfWarn;
+        }
+        else if (st == 2 && det.@event == "prediction") { rfText = $"RF: {det.pred} ({det.confidence:F2})"; rfSt = rfOk; }
+        else if (st == 2)                             { rfText = "RF: warming up (needs 30 s of running data)"; rfSt = rfIdle; }
+        else                                          { rfText = "RF: idle (conveyor not running)"; rfSt = rfIdle; }
+        GUI.Box(rr, rfText, rfSt);
 
         // Control panel, bottom of screen
         float py = Screen.height - 115;
@@ -295,6 +409,7 @@ public class BeltTwinClient : MonoBehaviour
         if (GUI.Button(new Rect(x, y1, bw, bh), "START")) SendCommand("start");
         if (GUI.Button(new Rect(x + (bw + 5), y1, bw, bh), "STOP")) SendCommand("stop");
         if (GUI.Button(new Rect(x + (bw + 5) * 2, y1, bw, bh), "RESET")) SendCommand("reset");
+        if (GUI.Button(new Rect(x + (bw + 5) * 3, y1, bw, bh), "MAINT")) SendCommand("maintenance");
 
         GUI.Label(new Rect(x, y2 - 19, 300, 18), "Inject fault:", textStyle);
         if (GUI.Button(new Rect(x, y2, bw, bh), "JAM")) SendCommand("jam");
