@@ -1,21 +1,46 @@
 using UnityEngine;
 
+// Moves the carriers (boxes) with the PLC's rPosition and colours the belt by PLC state.
+// The belt is extended by hiddenExtension at both ends, beyond the visible section
+// (beltLength), and the carriers wrap around over the whole extended length. So boxes are
+// created and removed off-screen: they enter the picture on one side and leave on the other.
 public class BeltVisual : MonoBehaviour
 {
     public BeltTwinClient client;
     public Renderer beltRenderer;
-    public float beltLength = 10f;
-    public int carrierCount = 6;
-    public float posScale = 0.01f;   // world units per rPosition unit
+    public float beltLength = 10f;        // visible section, framed by the camera
+    public float hiddenExtension = 8f;    // extra belt beyond each end of the visible section
+    public int carrierCount = 6;          // carriers on the visible section
+    public float posScale = 0.01f;        // world units per rPosition unit
 
     Transform[] carriers;
-    float unwrapped, displayed, lastPos;
+    float unwrapped, displayed, lastPos, totalLength;
     bool hasLast;
+
+    public float VisibleLength => beltLength * Mathf.Abs(transform.lossyScale.x);
+
+    void Awake()
+    {
+        totalLength = beltLength + 2f * hiddenExtension;
+        // Stretch the belt mesh symmetrically so it continues off-screen. Done in Awake so that
+        // FactoryEnvironment (Start) builds the frame around the full length.
+        if (beltRenderer != null && hiddenExtension > 0f)
+        {
+            var tr = beltRenderer.transform;
+            var s = tr.localScale;
+            tr.localScale = new Vector3(s.x * totalLength / beltLength, s.y, s.z);
+        }
+        else if (beltRenderer == null)
+        {
+            Debug.LogWarning("BeltVisual: beltRenderer not set, belt not extended; boxes will wrap beyond its ends.");
+        }
+    }
 
     void Start()
     {
-        carriers = new Transform[carrierCount];
-        for (int i = 0; i < carrierCount; i++)
+        int n = Mathf.Max(1, Mathf.RoundToInt(carrierCount * totalLength / beltLength));
+        carriers = new Transform[n];
+        for (int i = 0; i < n; i++)
         {
             var c = GameObject.CreatePrimitive(PrimitiveType.Cube);
             c.name = "Carrier" + i;
@@ -43,11 +68,11 @@ public class BeltVisual : MonoBehaviour
         // Smooth between 4 Hz updates so motion isn't jerky
         displayed = Mathf.Lerp(displayed, unwrapped, 1f - Mathf.Exp(-8f * Time.deltaTime));
 
-        float spacing = beltLength / carrierCount;
+        float spacing = totalLength / carriers.Length;
         float offset = displayed * posScale;
-        for (int i = 0; i < carrierCount; i++)
+        for (int i = 0; i < carriers.Length; i++)
         {
-            float x = Mathf.Repeat(offset + i * spacing, beltLength) - beltLength / 2f;
+            float x = Mathf.Repeat(offset + i * spacing, totalLength) - totalLength / 2f;
             carriers[i].localPosition = new Vector3(x, 0.9f, 0f);
         }
 
